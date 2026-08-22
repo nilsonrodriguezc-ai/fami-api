@@ -24,11 +24,10 @@ logger = logging.getLogger("fami-api")
 
 app = FastAPI(title="Fami API")
 
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "fami_catalogo_2026_seguro").strip()
-META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN", "EAAOebZAD1zV4BSHhFhp7Dh4GYzB6WXV8P3QqI97jjqYR6sBTs3seN2nIMQBabHet9q5YK84yXA85rZBNZADA2G0ZCPfz4cZCtqj619jqZCWavEAp5JWihVJmpyMSjeA4XkMLo0cZB7igot9r7pqVOnHCqMigsacAVnfMwRuc6sZCpvZB5PkCHlupqG55uP8sJVcUj2sxg1tMv6B66dmqEVfETuTft3OZAc5iKgsiUkW2SbclXoqysH5TzMDFJdVzk5qVx1txj2X4geXszZAXfdxIS6iQhZBv").strip()
-PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID", "1229341023598915").strip()
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "").strip()
+META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN", "").strip()
+PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID", "").strip()
 GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v23.0").strip()
-
 CATALOGO_URL = "https://nilsonrc9.wixsite.com/famalandia/tienda"
 
 
