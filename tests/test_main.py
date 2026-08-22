@@ -19,6 +19,22 @@ main = importlib.import_module("main")
 
 
 class WebhookTests(unittest.TestCase):
+    def test_catalog_still_works_before_database_is_configured(self) -> None:
+        message = {
+            "id": "wamid.catalog", "from": "51999999999",
+            "timestamp": "1700000000", "type": "text",
+            "text": {"body": "Quiero ver el catalogo"},
+        }
+        with (
+            patch.object(main, "DATABASE_URL", ""),
+            patch.object(
+                main, "enviar_mensaje", new_callable=AsyncMock,
+                return_value={"messages": [{"id": "wamid.auto"}]},
+            ) as send,
+        ):
+            asyncio.run(main._process_incoming_message(message, {}))
+        send.assert_awaited_once()
+
     def test_duplicate_message_does_not_trigger_catalog_response(self) -> None:
         message = {
             "id": "wamid.duplicate", "from": "51999999999",

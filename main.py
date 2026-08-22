@@ -111,6 +111,15 @@ async def _process_incoming_message(
         logger.info("Tipo de mensaje reservado para una fase posterior")
         return
     body = str((message.get("text") or {}).get("body") or "")
+    if not DATABASE_URL:
+        logger.warning("Persistencia WhatsApp pendiente: DATABASE_URL no configurada")
+        if solicita_catalogo(body):
+            automatic_text = (
+                "🛒 ¡Claro! Puedes revisar nuestro catálogo aquí:\n\n"
+                f"{CATALOGO_URL}\n\n✨ Encuentra lo inesperado."
+            )
+            await enviar_mensaje(phone, automatic_text)
+        return
     conversation_id, inserted = save_incoming_text(
         whatsapp_message_id=message_id,
         phone=phone,
@@ -155,7 +164,11 @@ async def process_webhook_payload(payload: dict[str, Any]) -> None:
                 for status in value.get("statuses", []):
                     message_id = str(status.get("id") or "")
                     state = str(status.get("status") or "")
-                    if message_id and update_message_status(message_id, state):
+                    if (
+                        DATABASE_URL
+                        and message_id
+                        and update_message_status(message_id, state)
+                    ):
                         logger.info("Estado actualizado id=%s estado=%s", message_id, state)
                 for message in value.get("messages", []):
                     await _process_incoming_message(message, contacts)
