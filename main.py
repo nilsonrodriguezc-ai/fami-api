@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import hmac
 import json
 import logging
 import os
 import re
 import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
 from typing import Any
 
 import httpx
@@ -79,6 +83,185 @@ def _redact_secrets(value: Any) -> str:
         sanitized,
     )
     return sanitized
+
+
+def _sanitize_diagnostic_value(value: Any) -> Any:
+    sensitive_names = {
+        "access_token", "authorization", "password", "service_role",
+        "database_url", "internal_api_token", "meta_access_token",
+    }
+    if isinstance(value, dict):
+        return {
+            str(key): (
+                "[REDACTED]"
+                if str(key).strip().casefold() in sensitive_names
+                else _sanitize_diagnostic_value(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_sanitize_diagnostic_value(item) for item in value]
+    if isinstance(value, str):
+        return _redact_secrets(value)
+    return value
+
+
+def _safe_meta_error(
+    status_code: int, payload: Any = None,
+) -> dict[str, Any]:
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if not isinstance(error, dict):
+        error = {}
+    return {
+        "ok": False,
+        "http_status": int(status_code),
+        "error": {
+            "message": _sanitize_diagnostic_value(error.get("message")),
+            "type": _sanitize_diagnostic_value(error.get("type")),
+            "code": _sanitize_diagnostic_value(error.get("code")),
+            "error_subcode": _sanitize_diagnostic_value(
+                error.get("error_subcode")
+            ),
+            "error_data": _sanitize_diagnostic_value(error.get("error_data")),
+            "fbtrace_id": _sanitize_diagnostic_value(error.get("fbtrace_id")),
+        },
+    }
+
+
+def _decode_json_body(body: bytes) -> dict[str, Any] | None:
+    try:
+        result = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return result if isinstance(result, dict) else None
+
+
+def _debug_current_meta_token_sync() -> dict[str, Any]:
+    """Consulta debug_token sin permitir que el token aparezca en logs HTTP."""
+    query = urllib.parse.urlencode({"input_token": META_ACCESS_TOKEN})
+    url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/debug_token?{query}"
+    request = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {META_ACCESS_TOKEN}"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            status_code = int(response.status)
+            payload = _decode_json_body(response.read())
+    except urllib.error.HTTPError as error:
+        status_code = int(error.code)
+        payload = _decode_json_body(error.read())
+    except (urllib.error.URLError, TimeoutError):
+        return {
+            "ok": False,
+            "http_status": None,
+            "error": {
+                "message": "No fue posible conectar con Meta.",
+                "type": "ConnectionError",
+                "code": None,
+                "error_subcode": None,
+                "error_data": None,
+                "fbtrace_id": None,
+            },
+        }
+    if status_code < 200 or status_code >= 300:
+        return _safe_meta_error(status_code, payload)
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        return _safe_meta_error(status_code, payload)
+    allowed = {
+        key: data.get(key)
+        for key in (
+            "is_valid", "app_id", "user_id", "system_user_id", "expires_at",
+            "data_access_expires_at", "scopes", "granular_scopes", "type",
+        )
+        if key in data
+    }
+    return {
+        "ok": True,
+        "http_status": status_code,
+        "data": _sanitize_diagnostic_value(allowed),
+    }
+
+
+async def _meta_graph_get(
+    object_path: str, *, fields: str | None = None,
+) -> dict[str, Any]:
+    path = str(object_path or "").strip().lstrip("/")
+    url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{path}"
+    params = {"fields": fields} if fields else None
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.get(
+                url,
+                headers={"Authorization": f"Bearer {META_ACCESS_TOKEN}"},
+                params=params,
+            )
+    except httpx.HTTPError:
+        return {
+            "ok": False,
+            "http_status": None,
+            "error": {
+                "message": "No fue posible conectar con Meta.",
+                "type": "ConnectionError",
+                "code": None,
+                "error_subcode": None,
+                "error_data": None,
+                "fbtrace_id": None,
+            },
+        }
+    try:
+        payload = response.json()
+    except (ValueError, json.JSONDecodeError):
+        payload = None
+    if not response.is_success:
+        return _safe_meta_error(response.status_code, payload)
+    return {
+        "ok": True,
+        "http_status": response.status_code,
+        "data": _sanitize_diagnostic_value(payload or {}),
+    }
+
+
+def _waba_candidates(
+    token_check: dict[str, Any], relation_check: dict[str, Any],
+) -> list[tuple[str, str]]:
+    candidates: list[tuple[str, str]] = []
+    relation = relation_check.get("data") if relation_check.get("ok") else None
+    related_waba = (
+        relation.get("whatsapp_business_account")
+        if isinstance(relation, dict)
+        else None
+    )
+    if isinstance(related_waba, dict) and related_waba.get("id"):
+        candidates.append(
+            (str(related_waba["id"]), "phone_number.whatsapp_business_account")
+        )
+    token_data = token_check.get("data") if token_check.get("ok") else None
+    granular_scopes = (
+        token_data.get("granular_scopes")
+        if isinstance(token_data, dict)
+        else None
+    )
+    if isinstance(granular_scopes, list):
+        for scope in granular_scopes:
+            if not isinstance(scope, dict):
+                continue
+            scope_name = str(scope.get("scope") or "")
+            if "whatsapp" not in scope_name.casefold():
+                continue
+            for target_id in scope.get("target_ids") or []:
+                candidates.append(
+                    (str(target_id), f"debug_token.granular_scopes.{scope_name}")
+                )
+    unique: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for candidate, source in candidates:
+        if candidate and candidate != PHONE_NUMBER_ID and candidate not in seen:
+            seen.add(candidate)
+            unique.append((candidate, source))
+    return unique[:20]
 
 
 async def enviar_mensaje(numero_destino: str, mensaje: str) -> dict[str, Any]:
@@ -299,6 +482,175 @@ async def receive_webhook(
     logger.info("Webhook aceptado con %s eventos procesables", event_count)
     background_tasks.add_task(process_webhook_payload, payload)
     return {"status": "recibido"}
+
+
+@app.get("/internal/meta/diagnostics")
+async def meta_diagnostics(
+    x_internal_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    if not INTERNAL_API_TOKEN or not hmac.compare_digest(
+        x_internal_token or "", INTERNAL_API_TOKEN
+    ):
+        raise HTTPException(status_code=401, detail="Acceso interno no autorizado")
+    if not META_ACCESS_TOKEN or not PHONE_NUMBER_ID:
+        raise HTTPException(
+            status_code=503,
+            detail="La conexión con Meta no está configurada.",
+        )
+
+    token_check = await asyncio.to_thread(_debug_current_meta_token_sync)
+    permissions_raw = await _meta_graph_get("me/permissions")
+    if permissions_raw.get("ok"):
+        permissions_data = permissions_raw.get("data") or {}
+        permissions = {
+            "ok": True,
+            "http_status": permissions_raw["http_status"],
+            "data": [
+                {
+                    "permission": item.get("permission"),
+                    "status": item.get("status"),
+                }
+                for item in permissions_data.get("data") or []
+                if isinstance(item, dict)
+            ],
+        }
+    else:
+        permissions = permissions_raw
+
+    phone_raw = await _meta_graph_get(
+        PHONE_NUMBER_ID,
+        fields="id,display_phone_number,verified_name,quality_rating",
+    )
+    if phone_raw.get("ok"):
+        phone_data = phone_raw.get("data") or {}
+        phone_check: dict[str, Any] = {
+            "ok": True,
+            "http_status": phone_raw["http_status"],
+            "data": {
+                key: phone_data.get(key)
+                for key in (
+                    "id", "display_phone_number", "verified_name",
+                    "quality_rating",
+                )
+                if key in phone_data
+            },
+        }
+    else:
+        phone_check = phone_raw
+
+    account_mode_check = await _meta_graph_get(
+        PHONE_NUMBER_ID, fields="account_mode"
+    )
+    if account_mode_check.get("ok"):
+        account_mode_data = account_mode_check.get("data") or {}
+        if phone_check.get("ok") and "account_mode" in account_mode_data:
+            phone_check["data"]["account_mode"] = account_mode_data[
+                "account_mode"
+            ]
+    else:
+        phone_check["account_mode_check"] = account_mode_check
+
+    relation_raw = await _meta_graph_get(
+        PHONE_NUMBER_ID, fields="whatsapp_business_account"
+    )
+    if relation_raw.get("ok"):
+        relation_data = relation_raw.get("data") or {}
+        relation = relation_data.get("whatsapp_business_account")
+        relation_check = {
+            "ok": True,
+            "http_status": relation_raw["http_status"],
+            "data": {
+                "whatsapp_business_account": {
+                    "id": relation.get("id"),
+                }
+            } if isinstance(relation, dict) and relation.get("id") else {},
+        }
+    else:
+        relation_check = relation_raw
+
+    attempts: list[dict[str, Any]] = []
+    resolved_waba: dict[str, Any] | None = None
+    for candidate_id, source in _waba_candidates(token_check, relation_check):
+        numbers_raw = await _meta_graph_get(
+            f"{candidate_id}/phone_numbers",
+            fields="id,display_phone_number,verified_name,quality_rating",
+        )
+        attempt: dict[str, Any] = {
+            "candidate_id": candidate_id,
+            "source": source,
+            "http_status": numbers_raw.get("http_status"),
+            "accessible": bool(numbers_raw.get("ok")),
+            "contains_phone_number_id": False,
+        }
+        if not numbers_raw.get("ok"):
+            attempt["error"] = numbers_raw.get("error")
+            attempts.append(attempt)
+            continue
+        numbers_data = numbers_raw.get("data") or {}
+        phone_numbers = numbers_data.get("data") or []
+        contains_phone = any(
+            isinstance(item, dict)
+            and str(item.get("id") or "") == PHONE_NUMBER_ID
+            for item in phone_numbers
+        )
+        attempt["contains_phone_number_id"] = contains_phone
+        attempts.append(attempt)
+        if not contains_phone:
+            continue
+        waba_raw = await _meta_graph_get(candidate_id, fields="id,name")
+        if waba_raw.get("ok"):
+            waba_data = waba_raw.get("data") or {}
+            resolved_waba = {
+                "ok": True,
+                "resolved": True,
+                "source": source,
+                "http_status": waba_raw["http_status"],
+                "data": {
+                    key: waba_data.get(key)
+                    for key in ("id", "name")
+                    if key in waba_data
+                },
+                "phone_numbers_access": {
+                    "ok": True,
+                    "http_status": numbers_raw["http_status"],
+                    "contains_phone_number_id": True,
+                },
+            }
+        else:
+            resolved_waba = {
+                "ok": False,
+                "resolved": True,
+                "source": source,
+                "waba_id": candidate_id,
+                "object_access": waba_raw,
+                "phone_numbers_access": {
+                    "ok": True,
+                    "http_status": numbers_raw["http_status"],
+                    "contains_phone_number_id": True,
+                },
+            }
+        break
+
+    waba_check = resolved_waba or {
+        "ok": False,
+        "resolved": False,
+        "reason": (
+            "Meta no devolvió una WABA candidata en la relación del número "
+            "ni en granular_scopes."
+            if not attempts
+            else "Ninguna WABA candidata accesible contiene el Phone Number ID."
+        ),
+        "attempts": attempts,
+    }
+    return {
+        "graph_api_version": GRAPH_API_VERSION,
+        "phone_number_id": PHONE_NUMBER_ID,
+        "token": token_check,
+        "permissions": permissions,
+        "phone_number": phone_check,
+        "phone_waba_relation": relation_check,
+        "waba": waba_check,
+    }
 
 
 @app.post("/internal/whatsapp/send-text")

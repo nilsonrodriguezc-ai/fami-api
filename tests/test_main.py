@@ -110,5 +110,113 @@ class InternalEndpointTests(unittest.TestCase):
         self.assertEqual(save.call_args.kwargs["sent_by_user_name"], "Cynthia Operadora")
 
 
+class MetaDiagnosticsTests(unittest.TestCase):
+    def test_diagnostics_rejects_missing_internal_token(self) -> None:
+        with patch.object(main, "_meta_graph_get", new_callable=AsyncMock) as get:
+            response = TestClient(main.app).get("/internal/meta/diagnostics")
+        self.assertEqual(response.status_code, 401)
+        get.assert_not_awaited()
+
+    def test_diagnostics_resolves_waba_without_exposing_secrets(self) -> None:
+        token_result = {
+            "ok": True,
+            "http_status": 200,
+            "data": {
+                "is_valid": True,
+                "app_id": "app-safe",
+                "system_user_id": "system-user-safe",
+                "scopes": ["whatsapp_business_messaging"],
+                "granular_scopes": [{
+                    "scope": "whatsapp_business_management",
+                    "target_ids": ["waba-safe"],
+                }],
+                "type": "SYSTEM_USER",
+            },
+        }
+
+        async def graph_result(
+            object_path: str, *, fields: str | None = None,
+        ) -> dict:
+            if object_path == "me/permissions":
+                return {
+                    "ok": True, "http_status": 200,
+                    "data": {"data": [{
+                        "permission": "whatsapp_business_messaging",
+                        "status": "granted",
+                    }]},
+                }
+            if object_path == "phone-test" and fields == "account_mode":
+                return {
+                    "ok": True, "http_status": 200,
+                    "data": {"account_mode": "LIVE"},
+                }
+            if (
+                object_path == "phone-test"
+                and fields == "whatsapp_business_account"
+            ):
+                return {"ok": True, "http_status": 200, "data": {}}
+            if object_path == "phone-test":
+                return {
+                    "ok": True, "http_status": 200,
+                    "data": {
+                        "id": "phone-test",
+                        "display_phone_number": "+51 938 259 714",
+                        "verified_name": "Famalandia",
+                        "quality_rating": "GREEN",
+                    },
+                }
+            if object_path == "waba-safe/phone_numbers":
+                return {
+                    "ok": True, "http_status": 200,
+                    "data": {"data": [{"id": "phone-test"}]},
+                }
+            if object_path == "waba-safe":
+                return {
+                    "ok": True, "http_status": 200,
+                    "data": {"id": "waba-safe", "name": "Fami WABA"},
+                }
+            raise AssertionError(f"Consulta no esperada: {object_path} {fields}")
+
+        with (
+            patch.object(
+                main, "_debug_current_meta_token_sync",
+                return_value=token_result,
+            ),
+            patch.object(main, "_meta_graph_get", side_effect=graph_result),
+        ):
+            response = TestClient(main.app).get(
+                "/internal/meta/diagnostics",
+                headers={"X-Internal-Token": "internal-test"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        result = response.json()
+        self.assertTrue(result["token"]["data"]["is_valid"])
+        self.assertEqual(result["waba"]["data"]["id"], "waba-safe")
+        serialized = response.text.casefold()
+        self.assertNotIn("meta-test", serialized)
+        self.assertNotIn("internal-test", serialized)
+        self.assertNotIn("postgresql://", serialized)
+
+    def test_meta_error_redacts_sensitive_error_data(self) -> None:
+        result = main._safe_meta_error(403, {
+            "error": {
+                "message": "Token meta-test was rejected",
+                "type": "OAuthException",
+                "code": 200,
+                "error_subcode": 123,
+                "error_data": {
+                    "access_token": "meta-test",
+                    "password": "secret-password",
+                },
+                "fbtrace_id": "trace-safe",
+            }
+        })
+        serialized = str(result).casefold()
+        self.assertNotIn("meta-test", serialized)
+        self.assertNotIn("secret-password", serialized)
+        self.assertIn("[redacted]", serialized)
+
+
 if __name__ == "__main__":
     unittest.main()
