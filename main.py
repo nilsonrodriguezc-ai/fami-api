@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hmac
+import json
 import logging
 import os
+import re
 import unicodedata
 from typing import Any
 
@@ -63,6 +65,22 @@ def _message_id(response: dict[str, Any]) -> str:
     return str(messages[0]["id"])
 
 
+def _redact_secrets(value: Any) -> str:
+    """Evita que una respuesta externa exponga secretos en los logs."""
+    sanitized = str(value)
+    for secret in (META_ACCESS_TOKEN, INTERNAL_API_TOKEN, DATABASE_URL):
+        if secret:
+            sanitized = sanitized.replace(secret, "[REDACTED]")
+    sanitized = re.sub(
+        r"(?i)([\"']?(?:access_token|authorization|password|service_role|"
+        r"database_url|internal_api_token|meta_access_token)[\"']?\s*[:=]\s*)"
+        r"(?:[\"'][^\"']*[\"']|[^,}\s]+)",
+        r"\1[REDACTED]",
+        sanitized,
+    )
+    return sanitized
+
+
 async def enviar_mensaje(numero_destino: str, mensaje: str) -> dict[str, Any]:
     if not META_ACCESS_TOKEN or not PHONE_NUMBER_ID:
         raise RuntimeError("La conexión con Meta no está configurada.")
@@ -90,7 +108,52 @@ async def enviar_mensaje(numero_destino: str, mensaje: str) -> dict[str, Any]:
         logger.info("Mensaje aceptado por Meta para destino terminado en %s", numero_destino[-4:])
         return result
     except httpx.HTTPStatusError as error:
-        logger.error("Meta rechazó el mensaje: HTTP %s", error.response.status_code)
+        response = error.response
+        logger.error("Meta rechazó el mensaje")
+        logger.error("Meta request URL: %s", url)
+        logger.error("Meta HTTP status: %s", response.status_code)
+        logger.error("Meta response.text: %s", _redact_secrets(response.text))
+        try:
+            response_data = response.json()
+        except (ValueError, json.JSONDecodeError):
+            response_data = None
+        meta_error = (
+            response_data.get("error")
+            if isinstance(response_data, dict)
+            else None
+        )
+        if isinstance(meta_error, dict):
+            logger.error(
+                "Meta error.message: %s",
+                _redact_secrets(meta_error.get("message")),
+            )
+            logger.error(
+                "Meta error.type: %s",
+                _redact_secrets(meta_error.get("type")),
+            )
+            logger.error(
+                "Meta error.code: %s",
+                _redact_secrets(meta_error.get("code")),
+            )
+            logger.error(
+                "Meta error.error_subcode: %s",
+                _redact_secrets(meta_error.get("error_subcode")),
+            )
+            if "error_data" in meta_error:
+                logger.error(
+                    "Meta error.error_data: %s",
+                    _redact_secrets(
+                        json.dumps(
+                            meta_error.get("error_data"),
+                            ensure_ascii=False,
+                            default=str,
+                        )
+                    ),
+                )
+            logger.error(
+                "Meta error.fbtrace_id: %s",
+                _redact_secrets(meta_error.get("fbtrace_id")),
+            )
         raise RuntimeError("Meta rechazó el mensaje.") from error
     except httpx.HTTPError as error:
         logger.exception("Error de conexión al comunicarse con Meta")
