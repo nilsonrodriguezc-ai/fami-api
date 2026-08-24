@@ -738,6 +738,8 @@ async def meta_diagnostics(
         )
     ) if isinstance(token_data, dict) else None
     assigned_wabas: dict[str, Any] | None = None
+    assigned_raw: dict[str, Any] | None = None
+    assigned_rows: list[Any] = []
     if system_user_id:
         assigned_raw = await _meta_graph_get(
             f"{system_user_id}/assigned_whatsapp_business_accounts",
@@ -763,6 +765,7 @@ async def meta_diagnostics(
         else:
             assigned_wabas["error"] = assigned_raw.get("error")
     collection_attempts: list[dict[str, Any]] = []
+    client_waba_ids: set[str] = set()
     for business in businesses:
         for edge in (
             "owned_whatsapp_business_accounts",
@@ -789,6 +792,8 @@ async def meta_diagnostics(
             for item in rows:
                 if not isinstance(item, dict) or not item.get("id"):
                     continue
+                if edge == "client_whatsapp_business_accounts":
+                    client_waba_ids.add(str(item["id"]))
                 candidates.append({
                     "id": str(item["id"]),
                     "name": item.get("name"),
@@ -890,6 +895,192 @@ async def meta_diagnostics(
     }
     if not businesses_raw.get("ok"):
         business_discovery["error"] = businesses_raw.get("error")
+
+    authority_raw = await _meta_graph_get(
+        KNOWN_DIAGNOSTIC_WABA_ID,
+        fields=(
+            "id,name,owner_business_info,on_behalf_of_business_info,"
+            "is_shared_with_partners,ownership_type"
+        ),
+    )
+    authority_data = (
+        authority_raw.get("data") or {} if authority_raw.get("ok") else {}
+    )
+    owner_info = authority_data.get("owner_business_info") or {}
+    if not isinstance(owner_info, dict):
+        owner_info = {}
+    owner_business_id = str(owner_info.get("id") or "") or None
+    checked_collection_business_ids = {
+        str(item.get("business_id"))
+        for item in collection_attempts
+        if item.get("business_id")
+    }
+    if owner_business_id and owner_business_id not in checked_collection_business_ids:
+        businesses.append({
+            "id": owner_business_id,
+            "name": owner_info.get("name"),
+            "source": "waba.owner_business_info",
+        })
+        for edge in (
+            "owned_whatsapp_business_accounts",
+            "client_whatsapp_business_accounts",
+        ):
+            collection_raw = await _meta_graph_get(
+                f"{owner_business_id}/{edge}", fields="id,name"
+            )
+            attempt = {
+                "business_id": owner_business_id,
+                "business_name": owner_info.get("name"),
+                "edge": edge,
+                "http_status": collection_raw.get("http_status"),
+                "accessible": bool(collection_raw.get("ok")),
+                "source": "waba.owner_business_info",
+            }
+            if collection_raw.get("ok"):
+                rows = (collection_raw.get("data") or {}).get("data") or []
+                attempt["waba_count"] = len(rows)
+                if edge == "client_whatsapp_business_accounts":
+                    client_waba_ids.update(
+                        str(item.get("id"))
+                        for item in rows
+                        if isinstance(item, dict) and item.get("id")
+                    )
+            else:
+                attempt["error"] = collection_raw.get("error")
+            collection_attempts.append(attempt)
+    business_ids_for_assignment = []
+    for possible_id in (
+        owner_business_id,
+        META_BUSINESS_ID or None,
+        *(business.get("id") for business in businesses),
+    ):
+        cleaned_id = str(possible_id or "")
+        if cleaned_id and cleaned_id not in business_ids_for_assignment:
+            business_ids_for_assignment.append(cleaned_id)
+
+    assigned_user_checks: list[dict[str, Any]] = []
+    matched_user: dict[str, Any] | None = None
+    for business_id in business_ids_for_assignment:
+        query = urllib.parse.urlencode({"business": business_id})
+        users_raw = await _meta_graph_get(
+            f"{KNOWN_DIAGNOSTIC_WABA_ID}/assigned_users?{query}",
+            fields="id,name,tasks",
+        )
+        check: dict[str, Any] = {
+            "business_id": business_id,
+            "http_status": users_raw.get("http_status"),
+            "accessible": bool(users_raw.get("ok")),
+        }
+        if users_raw.get("ok"):
+            user_rows = (users_raw.get("data") or {}).get("data") or []
+            check["assigned_user_count"] = len(user_rows)
+            for item in user_rows:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("id") or "") == str(system_user_id or ""):
+                    matched_user = {
+                        "id": str(item.get("id")),
+                        "name": item.get("name"),
+                        "tasks": [str(task) for task in item.get("tasks") or []],
+                        "business_id": business_id,
+                    }
+                    check["system_user_found"] = True
+                    check["system_user_tasks"] = matched_user["tasks"]
+                    break
+            else:
+                check["system_user_found"] = False
+        else:
+            check["error"] = users_raw.get("error")
+        assigned_user_checks.append(check)
+
+    direct_ids = {
+        str(item.get("id"))
+        for item in assigned_rows
+        if isinstance(item, dict) and item.get("id")
+    }
+    if assigned_raw is None or not assigned_raw.get("ok"):
+        directly_assigned: bool | str = "unknown"
+    else:
+        directly_assigned = KNOWN_DIAGNOSTIC_WABA_ID in direct_ids
+
+    client_attempts = [
+        item for item in collection_attempts
+        if item.get("edge") == "client_whatsapp_business_accounts"
+    ]
+    client_candidate_found = KNOWN_DIAGNOSTIC_WABA_ID in client_waba_ids
+    if client_candidate_found:
+        client_assigned: bool | str = True
+    elif any(item.get("accessible") for item in client_attempts):
+        client_assigned = False
+    else:
+        client_assigned = "unknown"
+
+    if matched_user is not None:
+        messaging_task: bool | str = "MESSAGING" in {
+            task.upper() for task in matched_user["tasks"]
+        }
+    elif any(item.get("accessible") for item in assigned_user_checks):
+        messaging_task = False
+    else:
+        messaging_task = "unknown"
+
+    partner_shared = authority_data.get("is_shared_with_partners")
+    on_behalf_info = authority_data.get("on_behalf_of_business_info")
+    partner_text = json.dumps(
+        on_behalf_info or {}, ensure_ascii=False, default=str
+    ).casefold()
+    if "respond.io" in partner_text or RESPOND_IO_APP_ID in partner_text:
+        respond_relationship: bool | str = True
+    elif partner_shared is False and not subscribed_apps_test[
+        "respond_io_subscribed"
+    ]:
+        respond_relationship = False
+    else:
+        respond_relationship = "unknown"
+
+    if directly_assigned is False and messaging_task is False:
+        conclusion = (
+            "La WABA no aparece asignada directamente al System User y no "
+            "se detectó la tarea MESSAGING. Este resultado es compatible con "
+            "el rechazo 403 de envío."
+        )
+    elif directly_assigned is True and messaging_task is True:
+        conclusion = (
+            "La asignación directa y la tarea MESSAGING fueron detectadas. "
+            "Estas comprobaciones no explican por sí solas el rechazo 403."
+        )
+    else:
+        conclusion = (
+            "Meta no permitió confirmar de forma completa la asignación y la "
+            "tarea MESSAGING; revisa los checks marcados como unknown."
+        )
+
+    effective_messaging_access = {
+        "system_user_id": str(system_user_id) if system_user_id else None,
+        "waba_id": KNOWN_DIAGNOSTIC_WABA_ID,
+        "phone_number_id": PHONE_NUMBER_ID,
+        "app_id": fami_app_id,
+        "owner_business_id": owner_business_id,
+        "waba_directly_assigned": directly_assigned,
+        "waba_client_assigned": client_assigned,
+        "messaging_task_detected": messaging_task,
+        "respond_io_relationship_detected": respond_relationship,
+        "conclusion": conclusion,
+        "raw_checks_sanitized": {
+            "waba_authority": authority_raw,
+            "system_user_assigned_wabas": assigned_raw,
+            "waba_assigned_users": assigned_user_checks,
+            "business_waba_collections": collection_attempts,
+            "fami_app_subscribed": subscribed_apps_test["fami_subscribed"],
+            "respond_io_app_subscribed": subscribed_apps_test[
+                "respond_io_subscribed"
+            ],
+            "is_shared_with_partners": partner_shared,
+            "on_behalf_of_business_info": _sanitize_diagnostic_value(
+                on_behalf_info
+            ),
+        },
+    }
     return {
         "graph_api_version": GRAPH_API_VERSION,
         "phone_number_id": PHONE_NUMBER_ID,
@@ -899,6 +1090,7 @@ async def meta_diagnostics(
         "known_waba_test": known_waba_test,
         "subscribed_apps_test": subscribed_apps_test,
         "business_discovery": business_discovery,
+        "effective_messaging_access": effective_messaging_access,
         "waba": waba_check,
     }
 

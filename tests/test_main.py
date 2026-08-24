@@ -142,6 +142,22 @@ class MetaDiagnosticsTests(unittest.TestCase):
                         "status": "granted",
                     }]},
                 }
+            if (
+                object_path == main.KNOWN_DIAGNOSTIC_WABA_ID
+                and fields
+                and "owner_business_info" in fields
+            ):
+                return {
+                    "ok": True, "http_status": 200,
+                    "data": {
+                        "id": main.KNOWN_DIAGNOSTIC_WABA_ID,
+                        "name": "Aplicación de WhatsApp Business",
+                        "owner_business_info": {
+                            "id": "business-safe", "name": "Fami Business",
+                        },
+                        "is_shared_with_partners": True,
+                    },
+                }
             if object_path == main.KNOWN_DIAGNOSTIC_WABA_ID:
                 return {
                     "ok": True, "http_status": 200,
@@ -188,7 +204,7 @@ class MetaDiagnosticsTests(unittest.TestCase):
                 return {
                     "ok": True, "http_status": 200,
                     "data": {"data": [{
-                        "id": "waba-safe",
+                        "id": main.KNOWN_DIAGNOSTIC_WABA_ID,
                         "name": "Aplicación de WhatsApp Business",
                     }]},
                 }
@@ -201,7 +217,25 @@ class MetaDiagnosticsTests(unittest.TestCase):
                     }]},
                 }
             if object_path == "business-safe/client_whatsapp_business_accounts":
-                return {"ok": True, "http_status": 200, "data": {"data": []}}
+                return {
+                    "ok": True, "http_status": 200,
+                    "data": {"data": [{
+                        "id": main.KNOWN_DIAGNOSTIC_WABA_ID,
+                        "name": "Aplicación de WhatsApp Business",
+                    }]},
+                }
+            if object_path == (
+                f"{main.KNOWN_DIAGNOSTIC_WABA_ID}/assigned_users?"
+                "business=business-safe"
+            ):
+                return {
+                    "ok": True, "http_status": 200,
+                    "data": {"data": [{
+                        "id": "system-user-safe",
+                        "name": "Employee",
+                        "tasks": ["MANAGE", "MESSAGING"],
+                    }]},
+                }
             if object_path == "phone-test" and fields == "account_mode":
                 return {
                     "ok": True, "http_status": 200,
@@ -269,6 +303,15 @@ class MetaDiagnosticsTests(unittest.TestCase):
         self.assertEqual(
             subscriptions["productive_webhook_app"]["app"]["id"],
             main.RESPOND_IO_APP_ID,
+        )
+        effective = result["effective_messaging_access"]
+        self.assertEqual(effective["system_user_id"], "system-user-safe")
+        self.assertEqual(effective["owner_business_id"], "business-safe")
+        self.assertTrue(effective["waba_directly_assigned"])
+        self.assertTrue(effective["waba_client_assigned"])
+        self.assertTrue(effective["messaging_task_detected"])
+        self.assertEqual(
+            effective["respond_io_relationship_detected"], "unknown"
         )
         self.assertFalse(any(
             call.kwargs.get("fields") == "whatsapp_business_account"
