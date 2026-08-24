@@ -37,6 +37,7 @@ META_BUSINESS_ID = (
     os.getenv("META_BUSINESS_ID") or os.getenv("BUSINESS_ID") or ""
 ).strip()
 KNOWN_DIAGNOSTIC_WABA_ID = "1553678296345682"
+RESPOND_IO_APP_ID = "1595811571129902"
 CATALOGO_URL = "https://nilsonrc9.wixsite.com/famalandia/tienda"
 
 
@@ -138,6 +139,18 @@ def _decode_json_body(body: bytes) -> dict[str, Any] | None:
     except (UnicodeDecodeError, json.JSONDecodeError):
         return None
     return result if isinstance(result, dict) else None
+
+
+def _safe_diagnostic_url(value: Any) -> str | None:
+    text_value = str(value or "").strip()
+    if not text_value:
+        return None
+    parsed = urllib.parse.urlsplit(text_value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, parsed.netloc, parsed.path, "", "")
+    )
 
 
 def _debug_current_meta_token_sync() -> dict[str, Any]:
@@ -611,6 +624,85 @@ async def meta_diagnostics(
         "errors": known_waba_errors,
     }
 
+    subscriptions_raw = await _meta_graph_get(
+        f"{KNOWN_DIAGNOSTIC_WABA_ID}/subscribed_apps"
+    )
+    subscription_rows = (
+        (subscriptions_raw.get("data") or {}).get("data") or []
+        if subscriptions_raw.get("ok")
+        else []
+    )
+    subscribed_apps: list[dict[str, Any]] = []
+    for item in subscription_rows:
+        if not isinstance(item, dict):
+            continue
+        app_data = item.get("whatsapp_business_api_data") or {}
+        if not isinstance(app_data, dict):
+            app_data = {}
+        subscribed_apps.append({
+            "id": str(app_data.get("id") or "") or None,
+            "name": app_data.get("name"),
+            "link": _safe_diagnostic_url(app_data.get("link")),
+            "override_callback_uri": _safe_diagnostic_url(
+                item.get("override_callback_uri")
+            ),
+        })
+    token_data_for_apps = (
+        token_check.get("data") if token_check.get("ok") else {}
+    )
+    fami_app_id = str(
+        (token_data_for_apps or {}).get("app_id") or ""
+    ) or None
+    subscribed_ids = {
+        str(item.get("id")) for item in subscribed_apps if item.get("id")
+    }
+    apps_with_override = [
+        item for item in subscribed_apps if item.get("override_callback_uri")
+    ]
+    if len(subscribed_apps) == 1:
+        webhook_determination = {
+            "determined": True,
+            "app": subscribed_apps[0],
+            "reason": "Meta devolvió una sola aplicación suscrita a la WABA.",
+        }
+    elif len(apps_with_override) == 1:
+        webhook_determination = {
+            "determined": True,
+            "app": apps_with_override[0],
+            "reason": (
+                "Meta devolvió una sola aplicación con callback sobrescrito."
+            ),
+        }
+    else:
+        webhook_determination = {
+            "determined": False,
+            "app": None,
+            "reason": (
+                "La lista de suscripciones no identifica el callback por "
+                "defecto de cada app; con cero o varias apps no puede "
+                "atribuirse un único webhook productivo."
+            ),
+        }
+    subscribed_apps_test: dict[str, Any] = {
+        "waba_id": KNOWN_DIAGNOSTIC_WABA_ID,
+        "ok": bool(subscriptions_raw.get("ok")),
+        "http_status": subscriptions_raw.get("http_status"),
+        "subscribed_app_count": len(subscribed_apps),
+        "more_than_one_app": len(subscribed_apps) > 1,
+        "fami_app_id": fami_app_id,
+        "fami_subscribed": bool(fami_app_id and fami_app_id in subscribed_ids),
+        "respond_io_app_id": RESPOND_IO_APP_ID,
+        "respond_io_subscribed": RESPOND_IO_APP_ID in subscribed_ids,
+        "apps": subscribed_apps,
+        "productive_webhook_app": webhook_determination,
+        "sending_permission_note": (
+            "La suscripción controla webhooks entrantes y no concede por sí "
+            "sola permiso para enviar mensajes."
+        ),
+    }
+    if not subscriptions_raw.get("ok"):
+        subscribed_apps_test["error"] = subscriptions_raw.get("error")
+
     businesses_raw = await _meta_graph_get("me/businesses", fields="id,name")
     business_rows = (
         (businesses_raw.get("data") or {}).get("data") or []
@@ -805,6 +897,7 @@ async def meta_diagnostics(
         "permissions": permissions,
         "phone_number": phone_check,
         "known_waba_test": known_waba_test,
+        "subscribed_apps_test": subscribed_apps_test,
         "business_discovery": business_discovery,
         "waba": waba_check,
     }

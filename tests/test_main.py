@@ -158,6 +158,25 @@ class MetaDiagnosticsTests(unittest.TestCase):
                         "display_phone_number": "+51 938 259 714",
                     }]},
                 }
+            if object_path == f"{main.KNOWN_DIAGNOSTIC_WABA_ID}/subscribed_apps":
+                return {
+                    "ok": True, "http_status": 200,
+                    "data": {"data": [
+                        {"whatsapp_business_api_data": {
+                            "id": "app-safe", "name": "Fami",
+                            "link": "https://example.test/fami",
+                        }},
+                        {
+                            "override_callback_uri": (
+                                "https://respond.example/webhook"
+                            ),
+                            "whatsapp_business_api_data": {
+                                "id": main.RESPOND_IO_APP_ID,
+                                "name": "respond.io WA BSP",
+                            },
+                        },
+                    ]},
+                }
             if object_path == "me/businesses":
                 return {
                     "ok": True, "http_status": 200,
@@ -240,6 +259,16 @@ class MetaDiagnosticsTests(unittest.TestCase):
         self.assertEqual(
             result["known_waba_test"]["http_status"],
             {"waba": 200, "phone_numbers": 200},
+        )
+        subscriptions = result["subscribed_apps_test"]
+        self.assertEqual(subscriptions["http_status"], 200)
+        self.assertEqual(subscriptions["subscribed_app_count"], 2)
+        self.assertTrue(subscriptions["more_than_one_app"])
+        self.assertTrue(subscriptions["fami_subscribed"])
+        self.assertTrue(subscriptions["respond_io_subscribed"])
+        self.assertEqual(
+            subscriptions["productive_webhook_app"]["app"]["id"],
+            main.RESPOND_IO_APP_ID,
         )
         self.assertFalse(any(
             call.kwargs.get("fields") == "whatsapp_business_account"
