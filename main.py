@@ -153,6 +153,103 @@ def _safe_diagnostic_url(value: Any) -> str | None:
     )
 
 
+def _build_cloud_api_registration_recovery(
+    *,
+    registration_status: Any,
+    name_status: Any,
+    platform_type: Any,
+    account_mode: Any,
+    certificate_present: bool,
+    raw_checks: dict[str, Any],
+) -> dict[str, Any]:
+    registration = str(registration_status or "").upper() or "unknown"
+    name_state = str(name_status or "").upper() or "unknown"
+    platform = str(platform_type or "").upper() or "unknown"
+    mode = str(account_mode or "").upper() or "unknown"
+    is_on_premise = platform == "ON_PREMISE"
+    is_cloud = platform == "CLOUD_API"
+    migration_required: bool | str = (
+        True if is_on_premise else False if is_cloud else "unknown"
+    )
+    register_supported: bool | str = (
+        True if is_on_premise or is_cloud else "unknown"
+    )
+    if is_on_premise:
+        recommended_action = (
+            "Confirmar primero si existe acceso al backup de la antigua "
+            "implementación On-Premise y al PIN de seis dígitos. Si existen, "
+            "el mecanismo documentado es migrar mediante /register con PIN y "
+            "backup. Si no existen, reanudar el alta del mismo número desde "
+            "WhatsApp Manager/Embedded Signup seleccionando la WABA existente "
+            "antes de intentar un registro Cloud."
+        )
+        blocking_reason = (
+            "El activo figura como ON_PREMISE y las consultas de solo lectura "
+            "no permiten confirmar la disponibilidad de backup.data, "
+            "backup.password ni del PIN. No debe ejecutarse un registro simple "
+            "hasta aclarar ese origen."
+        )
+    elif is_cloud and registration not in {"VERIFIED", "REGISTERED"}:
+        recommended_action = (
+            "Tras confirmar la propiedad del número y el PIN, el mecanismo "
+            "documentado es registrar el Phone Number ID mediante /register."
+        )
+        blocking_reason = (
+            "El número aún no figura verificado/registrado para Cloud API."
+        )
+    elif is_cloud:
+        recommended_action = (
+            "El número ya aparece en Cloud API; /register no debería ejecutarse "
+            "sin revisar primero el error específico vigente."
+        )
+        blocking_reason = None
+    else:
+        recommended_action = (
+            "Confirmar la modalidad del número en WhatsApp Manager o repetir "
+            "el onboarding de solo configuración antes de cualquier POST."
+        )
+        blocking_reason = (
+            "Meta no devolvió un platform_type que permita elegir entre "
+            "registro Cloud y migración On-Premise."
+        )
+    return {
+        "current_state": {
+            "registration_status": registration,
+            "name_status": name_state,
+            "platform_type": platform,
+            "hosting_type": platform,
+            "account_mode": mode,
+            "certificate_present": bool(certificate_present),
+        },
+        "expected_state": {
+            "registration_status": "VERIFIED/REGISTERED",
+            "platform_type": "CLOUD_API",
+            "hosting_type": "CLOUD_API",
+        },
+        "register_endpoint_supported": register_supported,
+        "pin_required": True,
+        "migration_required": migration_required,
+        "backup_required": True if is_on_premise else False if is_cloud else "unknown",
+        "certificate_required": False,
+        "smb_mode_detected": "unknown",
+        "recommended_action": recommended_action,
+        "exact_endpoint_if_applicable": (
+            f"POST https://graph.facebook.com/{GRAPH_API_VERSION}/"
+            f"{PHONE_NUMBER_ID}/register"
+            if register_supported is True
+            else None
+        ),
+        "required_payload_fields": (
+            ["messaging_product", "pin", "backup.data", "backup.password"]
+            if is_on_premise
+            else ["messaging_product", "pin"] if is_cloud else []
+        ),
+        "blocking_reason": blocking_reason,
+        "read_only_only": True,
+        "raw_checks_sanitized": _sanitize_diagnostic_value(raw_checks),
+    }
+
+
 def _debug_current_meta_token_sync() -> dict[str, Any]:
     """Consulta debug_token sin permitir que el token aparezca en logs HTTP."""
     query = urllib.parse.urlencode({"input_token": META_ACCESS_TOKEN})
@@ -1272,6 +1369,24 @@ async def meta_diagnostics(
             "phone_certificate": certificate_summary,
         },
     }
+    phone_check_data = (
+        phone_check.get("data") if phone_check.get("ok") else {}
+    ) or {}
+    cloud_api_registration_recovery = _build_cloud_api_registration_recovery(
+        registration_status=registration_status,
+        name_status=phone_registration_data.get("name_status"),
+        platform_type=platform_type,
+        account_mode=phone_check_data.get("account_mode"),
+        certificate_present=bool(certificate_value),
+        raw_checks={
+            "phone_core": phone_raw,
+            "account_mode": account_mode_check,
+            "registration": phone_registration_raw,
+            "name_status": phone_name_status_raw,
+            "platform_type": phone_platform_raw,
+            "certificate": certificate_summary,
+        },
+    )
     return {
         "graph_api_version": GRAPH_API_VERSION,
         "phone_number_id": PHONE_NUMBER_ID,
@@ -1283,6 +1398,7 @@ async def meta_diagnostics(
         "business_discovery": business_discovery,
         "effective_messaging_access": effective_messaging_access,
         "provider_relationship": provider_relationship,
+        "cloud_api_registration_recovery": cloud_api_registration_recovery,
         "waba": waba_check,
     }
 

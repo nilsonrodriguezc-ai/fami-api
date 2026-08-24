@@ -400,6 +400,30 @@ class MetaDiagnosticsTests(unittest.TestCase):
         self.assertNotIn("secret-password", serialized)
         self.assertIn("[redacted]", serialized)
 
+    def test_on_premise_recovery_requires_migration_without_executing_it(self) -> None:
+        result = main._build_cloud_api_registration_recovery(
+            registration_status="NOT_VERIFIED",
+            name_status="AVAILABLE_WITHOUT_REVIEW",
+            platform_type="ON_PREMISE",
+            account_mode="LIVE",
+            certificate_present=False,
+            raw_checks={"registration": {"ok": True, "http_status": 200}},
+        )
+        self.assertEqual(
+            result["current_state"]["platform_type"], "ON_PREMISE"
+        )
+        self.assertTrue(result["register_endpoint_supported"])
+        self.assertTrue(result["pin_required"])
+        self.assertTrue(result["migration_required"])
+        self.assertTrue(result["backup_required"])
+        self.assertFalse(result["certificate_required"])
+        self.assertEqual(result["smb_mode_detected"], "unknown")
+        self.assertTrue(result["read_only_only"])
+        self.assertEqual(
+            result["required_payload_fields"],
+            ["messaging_product", "pin", "backup.data", "backup.password"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
