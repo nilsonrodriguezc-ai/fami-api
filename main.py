@@ -896,16 +896,36 @@ async def meta_diagnostics(
     if not businesses_raw.get("ok"):
         business_discovery["error"] = businesses_raw.get("error")
 
-    authority_raw = await _meta_graph_get(
+    authority_owner_raw = await _meta_graph_get(
+        KNOWN_DIAGNOSTIC_WABA_ID,
+        fields="id,name,owner_business,owner_business_info",
+    )
+    authority_on_behalf_raw = await _meta_graph_get(
+        KNOWN_DIAGNOSTIC_WABA_ID, fields="on_behalf_of_business_info"
+    )
+    authority_relationship_raw = await _meta_graph_get(
         KNOWN_DIAGNOSTIC_WABA_ID,
         fields=(
-            "id,name,owner_business_info,on_behalf_of_business_info,"
-            "is_shared_with_partners,ownership_type"
+            "is_shared_with_partners,ownership_type,status,"
+            "account_review_status,business_verification_status"
         ),
     )
-    authority_data = (
-        authority_raw.get("data") or {} if authority_raw.get("ok") else {}
-    )
+    authority_data: dict[str, Any] = {}
+    for check in (
+        authority_owner_raw,
+        authority_on_behalf_raw,
+        authority_relationship_raw,
+    ):
+        if check.get("ok") and isinstance(check.get("data"), dict):
+            authority_data.update(check["data"])
+    authority_raw = {
+        "data": _sanitize_diagnostic_value(authority_data),
+        "checks": {
+            "owner": authority_owner_raw,
+            "on_behalf_of_business": authority_on_behalf_raw,
+            "relationship_and_status": authority_relationship_raw,
+        },
+    }
     owner_info = authority_data.get("owner_business_info") or {}
     if not isinstance(owner_info, dict):
         owner_info = {}
@@ -1081,6 +1101,177 @@ async def meta_diagnostics(
             ),
         },
     }
+
+    phone_registration_raw = await _meta_graph_get(
+        PHONE_NUMBER_ID,
+        fields=(
+            "id,display_phone_number,verified_name,quality_rating,"
+            "code_verification_status"
+        ),
+    )
+    phone_name_status_raw = await _meta_graph_get(
+        PHONE_NUMBER_ID, fields="name_status"
+    )
+    phone_platform_raw = await _meta_graph_get(
+        PHONE_NUMBER_ID, fields="platform_type"
+    )
+    phone_certificate_raw = await _meta_graph_get(
+        PHONE_NUMBER_ID, fields="certificate"
+    )
+    phone_registration_data: dict[str, Any] = {}
+    for check in (
+        phone_registration_raw,
+        phone_name_status_raw,
+        phone_platform_raw,
+    ):
+        if check.get("ok") and isinstance(check.get("data"), dict):
+            phone_registration_data.update(check["data"])
+    certificate_data = (
+        phone_certificate_raw.get("data") or {}
+        if phone_certificate_raw.get("ok")
+        else {}
+    )
+    certificate_value = (
+        certificate_data.get("certificate")
+        if isinstance(certificate_data, dict)
+        else None
+    )
+    certificate_summary = {
+        "http_status": phone_certificate_raw.get("http_status"),
+        "readable": bool(phone_certificate_raw.get("ok")),
+        "certificate_present": bool(certificate_value),
+    }
+    if not phone_certificate_raw.get("ok"):
+        certificate_summary["error"] = phone_certificate_raw.get("error")
+
+    on_behalf_value = authority_data.get("on_behalf_of_business_info")
+    partner_business_ids: list[str] = []
+
+    def collect_business_ids(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                normalized_key = str(key).casefold()
+                if normalized_key in {"id", "business_id"} and item:
+                    candidate_id = str(item)
+                    if candidate_id not in partner_business_ids:
+                        partner_business_ids.append(candidate_id)
+                elif isinstance(item, (dict, list)):
+                    collect_business_ids(item)
+        elif isinstance(value, list):
+            for item in value:
+                collect_business_ids(item)
+
+    collect_business_ids(on_behalf_value)
+    owner_business_value = authority_data.get("owner_business")
+    owner_business_from_field = (
+        str(owner_business_value.get("id") or "")
+        if isinstance(owner_business_value, dict)
+        else str(owner_business_value or "")
+    ) or None
+    effective_owner_business_id = owner_business_id or owner_business_from_field
+    partner_business_ids = [
+        item for item in partner_business_ids
+        if item != effective_owner_business_id
+    ]
+
+    relationship_text = json.dumps(
+        {
+            "on_behalf": on_behalf_value,
+            "ownership_type": authority_data.get("ownership_type"),
+        },
+        ensure_ascii=False,
+        default=str,
+    ).casefold()
+    is_shared = authority_data.get("is_shared_with_partners")
+    if (
+        bool(on_behalf_value)
+        or bool(partner_business_ids)
+        or is_shared is True
+        or "partner" in relationship_text
+        or "bsp" in relationship_text
+    ):
+        provider_detected: bool | str = True
+    elif (
+        authority_on_behalf_raw.get("ok")
+        and authority_relationship_raw.get("ok")
+        and is_shared is False
+    ):
+        provider_detected = False
+    else:
+        provider_detected = "unknown"
+
+    respond_evidence_text = json.dumps(
+        {
+            "on_behalf": on_behalf_value,
+            "partner_business_ids": partner_business_ids,
+        },
+        ensure_ascii=False,
+        default=str,
+    ).casefold()
+    if "respond.io" in respond_evidence_text or RESPOND_IO_APP_ID in (
+        respond_evidence_text
+    ):
+        respond_detected: bool | str = True
+    elif provider_detected is False:
+        respond_detected = False
+    else:
+        respond_detected = "unknown"
+
+    registration_status = phone_registration_data.get(
+        "code_verification_status"
+    )
+    platform_type = phone_registration_data.get("platform_type")
+    if respond_detected is True:
+        provider_conclusion = (
+            "Meta identifica explícitamente a respond.io en la relación del "
+            "activo. Esta relación podría ser relevante para el 403, pero "
+            "el diagnóstico no demuestra control exclusivo de envío."
+        )
+    elif provider_detected is True:
+        provider_conclusion = (
+            "Meta confirma una relación de partner/proveedor, pero los campos "
+            "disponibles no identifican específicamente a respond.io. No es "
+            "posible atribuir el 403 a respond.io solo con esta evidencia."
+        )
+    elif provider_detected is False:
+        provider_conclusion = (
+            "Los campos consultados no muestran una relación activa de "
+            "partner/proveedor. Esta hipótesis no explica el 403."
+        )
+    else:
+        provider_conclusion = (
+            "Meta no expuso suficiente información para confirmar o descartar "
+            "una relación operativa con un BSP. Revisa los errores sanitizados."
+        )
+
+    provider_relationship = {
+        "owner_business_id": effective_owner_business_id,
+        "owner_business_info": _sanitize_diagnostic_value(owner_info),
+        "on_behalf_of_business_id": (
+            partner_business_ids[0] if len(partner_business_ids) == 1 else None
+        ),
+        "on_behalf_of_business_info": _sanitize_diagnostic_value(
+            on_behalf_value
+        ),
+        "partner_business_ids": partner_business_ids,
+        "is_shared_with_partners": is_shared,
+        "ownership_type": authority_data.get("ownership_type"),
+        "bsp_or_solution_provider_detected": provider_detected,
+        "respond_io_detected": respond_detected,
+        "phone_registration_status": registration_status,
+        "phone_name_status": phone_registration_data.get("name_status"),
+        "platform_type": platform_type,
+        "hosting_type": platform_type or "unknown",
+        "certificate": certificate_summary,
+        "conclusion": provider_conclusion,
+        "waba_authority": authority_raw,
+        "raw_checks_sanitized": {
+            "phone_registration": phone_registration_raw,
+            "phone_name_status": phone_name_status_raw,
+            "phone_platform_type": phone_platform_raw,
+            "phone_certificate": certificate_summary,
+        },
+    }
     return {
         "graph_api_version": GRAPH_API_VERSION,
         "phone_number_id": PHONE_NUMBER_ID,
@@ -1091,6 +1282,7 @@ async def meta_diagnostics(
         "subscribed_apps_test": subscribed_apps_test,
         "business_discovery": business_discovery,
         "effective_messaging_access": effective_messaging_access,
+        "provider_relationship": provider_relationship,
         "waba": waba_check,
     }
 

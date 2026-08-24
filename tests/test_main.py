@@ -158,6 +158,29 @@ class MetaDiagnosticsTests(unittest.TestCase):
                         "is_shared_with_partners": True,
                     },
                 }
+            if (
+                object_path == main.KNOWN_DIAGNOSTIC_WABA_ID
+                and fields == "on_behalf_of_business_info"
+            ):
+                return {
+                    "ok": True, "http_status": 200,
+                    "data": {"on_behalf_of_business_info": {
+                        "id": "partner-safe", "name": "respond.io",
+                    }},
+                }
+            if (
+                object_path == main.KNOWN_DIAGNOSTIC_WABA_ID
+                and fields
+                and "ownership_type" in fields
+            ):
+                return {
+                    "ok": True, "http_status": 200,
+                    "data": {
+                        "is_shared_with_partners": True,
+                        "ownership_type": "PARTNER_OWNED",
+                        "status": "ACTIVE",
+                    },
+                }
             if object_path == main.KNOWN_DIAGNOSTIC_WABA_ID:
                 return {
                     "ok": True, "http_status": 200,
@@ -241,6 +264,33 @@ class MetaDiagnosticsTests(unittest.TestCase):
                     "ok": True, "http_status": 200,
                     "data": {"account_mode": "LIVE"},
                 }
+            if (
+                object_path == "phone-test"
+                and fields
+                and "code_verification_status" in fields
+            ):
+                return {
+                    "ok": True, "http_status": 200,
+                    "data": {
+                        "id": "phone-test",
+                        "code_verification_status": "VERIFIED",
+                    },
+                }
+            if object_path == "phone-test" and fields == "name_status":
+                return {
+                    "ok": True, "http_status": 200,
+                    "data": {"name_status": "APPROVED"},
+                }
+            if object_path == "phone-test" and fields == "platform_type":
+                return {
+                    "ok": True, "http_status": 200,
+                    "data": {"platform_type": "CLOUD_API"},
+                }
+            if object_path == "phone-test" and fields == "certificate":
+                return {
+                    "ok": True, "http_status": 200,
+                    "data": {"certificate": "certificate-must-not-leak"},
+                }
             if object_path == "phone-test":
                 return {
                     "ok": True, "http_status": 200,
@@ -310,9 +360,17 @@ class MetaDiagnosticsTests(unittest.TestCase):
         self.assertTrue(effective["waba_directly_assigned"])
         self.assertTrue(effective["waba_client_assigned"])
         self.assertTrue(effective["messaging_task_detected"])
+        self.assertTrue(effective["respond_io_relationship_detected"])
+        provider = result["provider_relationship"]
+        self.assertEqual(provider["owner_business_id"], "business-safe")
         self.assertEqual(
-            effective["respond_io_relationship_detected"], "unknown"
+            provider["on_behalf_of_business_id"], "partner-safe"
         )
+        self.assertTrue(provider["bsp_or_solution_provider_detected"])
+        self.assertTrue(provider["respond_io_detected"])
+        self.assertEqual(provider["phone_registration_status"], "VERIFIED")
+        self.assertEqual(provider["platform_type"], "CLOUD_API")
+        self.assertTrue(provider["certificate"]["certificate_present"])
         self.assertFalse(any(
             call.kwargs.get("fields") == "whatsapp_business_account"
             for call in graph_get.await_args_list
@@ -321,6 +379,7 @@ class MetaDiagnosticsTests(unittest.TestCase):
         self.assertNotIn("meta-test", serialized)
         self.assertNotIn("internal-test", serialized)
         self.assertNotIn("postgresql://", serialized)
+        self.assertNotIn("certificate-must-not-leak", serialized)
 
     def test_meta_error_redacts_sensitive_error_data(self) -> None:
         result = main._safe_meta_error(403, {
