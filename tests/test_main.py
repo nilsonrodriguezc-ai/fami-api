@@ -126,10 +126,7 @@ class MetaDiagnosticsTests(unittest.TestCase):
                 "app_id": "app-safe",
                 "system_user_id": "system-user-safe",
                 "scopes": ["whatsapp_business_messaging"],
-                "granular_scopes": [{
-                    "scope": "whatsapp_business_management",
-                    "target_ids": ["waba-safe"],
-                }],
+                "granular_scopes": [],
                 "type": "SYSTEM_USER",
             },
         }
@@ -145,16 +142,36 @@ class MetaDiagnosticsTests(unittest.TestCase):
                         "status": "granted",
                     }]},
                 }
+            if object_path == "me/businesses":
+                return {
+                    "ok": True, "http_status": 200,
+                    "data": {"data": [{
+                        "id": "business-safe", "name": "Fami Business",
+                    }]},
+                }
+            if object_path == "system-user-safe/assigned_whatsapp_business_accounts":
+                return {
+                    "ok": True, "http_status": 200,
+                    "data": {"data": [{
+                        "id": "waba-safe",
+                        "name": "Aplicación de WhatsApp Business",
+                    }]},
+                }
+            if object_path == "business-safe/owned_whatsapp_business_accounts":
+                return {
+                    "ok": True, "http_status": 200,
+                    "data": {"data": [{
+                        "id": "waba-safe",
+                        "name": "Aplicación de WhatsApp Business",
+                    }]},
+                }
+            if object_path == "business-safe/client_whatsapp_business_accounts":
+                return {"ok": True, "http_status": 200, "data": {"data": []}}
             if object_path == "phone-test" and fields == "account_mode":
                 return {
                     "ok": True, "http_status": 200,
                     "data": {"account_mode": "LIVE"},
                 }
-            if (
-                object_path == "phone-test"
-                and fields == "whatsapp_business_account"
-            ):
-                return {"ok": True, "http_status": 200, "data": {}}
             if object_path == "phone-test":
                 return {
                     "ok": True, "http_status": 200,
@@ -170,11 +187,6 @@ class MetaDiagnosticsTests(unittest.TestCase):
                     "ok": True, "http_status": 200,
                     "data": {"data": [{"id": "phone-test"}]},
                 }
-            if object_path == "waba-safe":
-                return {
-                    "ok": True, "http_status": 200,
-                    "data": {"id": "waba-safe", "name": "Fami WABA"},
-                }
             raise AssertionError(f"Consulta no esperada: {object_path} {fields}")
 
         with (
@@ -182,7 +194,9 @@ class MetaDiagnosticsTests(unittest.TestCase):
                 main, "_debug_current_meta_token_sync",
                 return_value=token_result,
             ),
-            patch.object(main, "_meta_graph_get", side_effect=graph_result),
+            patch.object(
+                main, "_meta_graph_get", side_effect=graph_result,
+            ) as graph_get,
         ):
             response = TestClient(main.app).get(
                 "/internal/meta/diagnostics",
@@ -192,7 +206,16 @@ class MetaDiagnosticsTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         result = response.json()
         self.assertTrue(result["token"]["data"]["is_valid"])
-        self.assertEqual(result["waba"]["data"]["id"], "waba-safe")
+        self.assertEqual(result["waba"]["id"], "waba-safe")
+        self.assertEqual(
+            result["waba"]["name"], "Aplicación de WhatsApp Business"
+        )
+        self.assertEqual(result["waba"]["phone_number_id"], "phone-test")
+        self.assertTrue(result["waba"]["phone_numbers_accessible"])
+        self.assertFalse(any(
+            call.kwargs.get("fields") == "whatsapp_business_account"
+            for call in graph_get.await_args_list
+        ))
         serialized = response.text.casefold()
         self.assertNotIn("meta-test", serialized)
         self.assertNotIn("internal-test", serialized)

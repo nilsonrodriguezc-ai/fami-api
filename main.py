@@ -224,20 +224,10 @@ async def _meta_graph_get(
     }
 
 
-def _waba_candidates(
-    token_check: dict[str, Any], relation_check: dict[str, Any],
-) -> list[tuple[str, str]]:
-    candidates: list[tuple[str, str]] = []
-    relation = relation_check.get("data") if relation_check.get("ok") else None
-    related_waba = (
-        relation.get("whatsapp_business_account")
-        if isinstance(relation, dict)
-        else None
-    )
-    if isinstance(related_waba, dict) and related_waba.get("id"):
-        candidates.append(
-            (str(related_waba["id"]), "phone_number.whatsapp_business_account")
-        )
+def _granular_waba_candidates(
+    token_check: dict[str, Any],
+) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
     token_data = token_check.get("data") if token_check.get("ok") else None
     granular_scopes = (
         token_data.get("granular_scopes")
@@ -252,16 +242,30 @@ def _waba_candidates(
             if "whatsapp" not in scope_name.casefold():
                 continue
             for target_id in scope.get("target_ids") or []:
-                candidates.append(
-                    (str(target_id), f"debug_token.granular_scopes.{scope_name}")
-                )
-    unique: list[tuple[str, str]] = []
+                candidates.append({
+                    "id": str(target_id),
+                    "name": None,
+                    "source": f"debug_token.granular_scopes.{scope_name}",
+                    "business_id": None,
+                })
+    return candidates
+
+
+def _unique_waba_candidates(
+    candidates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    unique: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for candidate, source in candidates:
-        if candidate and candidate != PHONE_NUMBER_ID and candidate not in seen:
-            seen.add(candidate)
-            unique.append((candidate, source))
-    return unique[:20]
+    for candidate in candidates:
+        candidate_id = str(candidate.get("id") or "")
+        if (
+            candidate_id
+            and candidate_id != PHONE_NUMBER_ID
+            and candidate_id not in seen
+        ):
+            seen.add(candidate_id)
+            unique.append(candidate)
+    return unique[:50]
 
 
 async def enviar_mensaje(numero_destino: str, mensaje: str) -> dict[str, Any]:
@@ -550,34 +554,101 @@ async def meta_diagnostics(
     else:
         phone_check["account_mode_check"] = account_mode_check
 
-    relation_raw = await _meta_graph_get(
-        PHONE_NUMBER_ID, fields="whatsapp_business_account"
+    businesses_raw = await _meta_graph_get("me/businesses", fields="id,name")
+    business_rows = (
+        (businesses_raw.get("data") or {}).get("data") or []
+        if businesses_raw.get("ok")
+        else []
     )
-    if relation_raw.get("ok"):
-        relation_data = relation_raw.get("data") or {}
-        relation = relation_data.get("whatsapp_business_account")
-        relation_check = {
-            "ok": True,
-            "http_status": relation_raw["http_status"],
-            "data": {
-                "whatsapp_business_account": {
-                    "id": relation.get("id"),
-                }
-            } if isinstance(relation, dict) and relation.get("id") else {},
+    businesses = [
+        {"id": str(item.get("id")), "name": item.get("name")}
+        for item in business_rows
+        if isinstance(item, dict) and item.get("id")
+    ]
+
+    candidates = _granular_waba_candidates(token_check)
+    token_data = token_check.get("data") if token_check.get("ok") else {}
+    system_user_id = (
+        token_data.get("system_user_id")
+        or (
+            token_data.get("user_id")
+            if str(token_data.get("type") or "").upper() == "SYSTEM_USER"
+            else None
+        )
+    ) if isinstance(token_data, dict) else None
+    assigned_wabas: dict[str, Any] | None = None
+    if system_user_id:
+        assigned_raw = await _meta_graph_get(
+            f"{system_user_id}/assigned_whatsapp_business_accounts",
+            fields="id,name",
+        )
+        assigned_wabas = {
+            "system_user_id": str(system_user_id),
+            "http_status": assigned_raw.get("http_status"),
+            "accessible": bool(assigned_raw.get("ok")),
         }
-    else:
-        relation_check = relation_raw
+        if assigned_raw.get("ok"):
+            assigned_rows = (assigned_raw.get("data") or {}).get("data") or []
+            assigned_wabas["waba_count"] = len(assigned_rows)
+            for item in assigned_rows:
+                if not isinstance(item, dict) or not item.get("id"):
+                    continue
+                candidates.append({
+                    "id": str(item["id"]),
+                    "name": item.get("name"),
+                    "source": "system_user.assigned_whatsapp_business_accounts",
+                    "business_id": None,
+                })
+        else:
+            assigned_wabas["error"] = assigned_raw.get("error")
+    collection_attempts: list[dict[str, Any]] = []
+    for business in businesses:
+        for edge in (
+            "owned_whatsapp_business_accounts",
+            "client_whatsapp_business_accounts",
+        ):
+            collection_raw = await _meta_graph_get(
+                f"{business['id']}/{edge}", fields="id,name"
+            )
+            attempt: dict[str, Any] = {
+                "business_id": business["id"],
+                "business_name": business.get("name"),
+                "edge": edge,
+                "http_status": collection_raw.get("http_status"),
+                "accessible": bool(collection_raw.get("ok")),
+            }
+            if not collection_raw.get("ok"):
+                attempt["error"] = collection_raw.get("error")
+                collection_attempts.append(attempt)
+                continue
+            collection_data = collection_raw.get("data") or {}
+            rows = collection_data.get("data") or []
+            attempt["waba_count"] = len(rows)
+            collection_attempts.append(attempt)
+            for item in rows:
+                if not isinstance(item, dict) or not item.get("id"):
+                    continue
+                candidates.append({
+                    "id": str(item["id"]),
+                    "name": item.get("name"),
+                    "source": edge,
+                    "business_id": business["id"],
+                })
+    candidates = _unique_waba_candidates(candidates)
 
     attempts: list[dict[str, Any]] = []
     resolved_waba: dict[str, Any] | None = None
-    for candidate_id, source in _waba_candidates(token_check, relation_check):
+    for candidate in candidates:
+        candidate_id = str(candidate["id"])
         numbers_raw = await _meta_graph_get(
             f"{candidate_id}/phone_numbers",
             fields="id,display_phone_number,verified_name,quality_rating",
         )
         attempt: dict[str, Any] = {
             "candidate_id": candidate_id,
-            "source": source,
+            "candidate_name": candidate.get("name"),
+            "source": candidate.get("source"),
+            "business_id": candidate.get("business_id"),
             "http_status": numbers_raw.get("http_status"),
             "accessible": bool(numbers_raw.get("ok")),
             "contains_phone_number_id": False,
@@ -597,58 +668,46 @@ async def meta_diagnostics(
         attempts.append(attempt)
         if not contains_phone:
             continue
-        waba_raw = await _meta_graph_get(candidate_id, fields="id,name")
-        if waba_raw.get("ok"):
-            waba_data = waba_raw.get("data") or {}
-            resolved_waba = {
-                "ok": True,
-                "resolved": True,
-                "source": source,
-                "http_status": waba_raw["http_status"],
-                "data": {
-                    key: waba_data.get(key)
-                    for key in ("id", "name")
-                    if key in waba_data
-                },
-                "phone_numbers_access": {
-                    "ok": True,
-                    "http_status": numbers_raw["http_status"],
-                    "contains_phone_number_id": True,
-                },
-            }
-        else:
-            resolved_waba = {
-                "ok": False,
-                "resolved": True,
-                "source": source,
-                "waba_id": candidate_id,
-                "object_access": waba_raw,
-                "phone_numbers_access": {
-                    "ok": True,
-                    "http_status": numbers_raw["http_status"],
-                    "contains_phone_number_id": True,
-                },
-            }
+        resolved_waba = {
+            "ok": True,
+            "resolved": True,
+            "id": candidate_id,
+            "name": candidate.get("name"),
+            "phone_number_id": PHONE_NUMBER_ID,
+            "source": candidate.get("source"),
+            "business_id": candidate.get("business_id"),
+            "phone_numbers_http_status": numbers_raw["http_status"],
+            "phone_numbers_accessible": True,
+        }
         break
 
     waba_check = resolved_waba or {
         "ok": False,
         "resolved": False,
         "reason": (
-            "Meta no devolvió una WABA candidata en la relación del número "
-            "ni en granular_scopes."
+            "Meta no devolvió WABA candidatas mediante los Business accesibles "
+            "ni mediante granular_scopes."
             if not attempts
             else "Ninguna WABA candidata accesible contiene el Phone Number ID."
         ),
         "attempts": attempts,
     }
+    business_discovery = {
+        "ok": bool(businesses_raw.get("ok")),
+        "http_status": businesses_raw.get("http_status"),
+        "system_user_assigned_wabas": assigned_wabas,
+        "businesses": businesses,
+        "waba_collection_attempts": collection_attempts,
+    }
+    if not businesses_raw.get("ok"):
+        business_discovery["error"] = businesses_raw.get("error")
     return {
         "graph_api_version": GRAPH_API_VERSION,
         "phone_number_id": PHONE_NUMBER_ID,
         "token": token_check,
         "permissions": permissions,
         "phone_number": phone_check,
-        "phone_waba_relation": relation_check,
+        "business_discovery": business_discovery,
         "waba": waba_check,
     }
 
