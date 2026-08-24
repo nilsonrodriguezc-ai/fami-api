@@ -142,6 +142,22 @@ class MetaDiagnosticsTests(unittest.TestCase):
                         "status": "granted",
                     }]},
                 }
+            if object_path == main.KNOWN_DIAGNOSTIC_WABA_ID:
+                return {
+                    "ok": True, "http_status": 200,
+                    "data": {
+                        "id": main.KNOWN_DIAGNOSTIC_WABA_ID,
+                        "name": "Aplicación de WhatsApp Business",
+                    },
+                }
+            if object_path == f"{main.KNOWN_DIAGNOSTIC_WABA_ID}/phone_numbers":
+                return {
+                    "ok": True, "http_status": 200,
+                    "data": {"data": [{
+                        "id": "phone-test",
+                        "display_phone_number": "+51 938 259 714",
+                    }]},
+                }
             if object_path == "me/businesses":
                 return {
                     "ok": True, "http_status": 200,
@@ -206,12 +222,25 @@ class MetaDiagnosticsTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         result = response.json()
         self.assertTrue(result["token"]["data"]["is_valid"])
-        self.assertEqual(result["waba"]["id"], "waba-safe")
+        self.assertEqual(
+            result["waba"]["id"], main.KNOWN_DIAGNOSTIC_WABA_ID
+        )
         self.assertEqual(
             result["waba"]["name"], "Aplicación de WhatsApp Business"
         )
         self.assertEqual(result["waba"]["phone_number_id"], "phone-test")
         self.assertTrue(result["waba"]["phone_numbers_accessible"])
+        self.assertTrue(result["known_waba_test"]["waba_readable"])
+        self.assertTrue(
+            result["known_waba_test"]["phone_numbers_readable"]
+        )
+        self.assertTrue(
+            result["known_waba_test"]["contains_expected_phone_number"]
+        )
+        self.assertEqual(
+            result["known_waba_test"]["http_status"],
+            {"waba": 200, "phone_numbers": 200},
+        )
         self.assertFalse(any(
             call.kwargs.get("fields") == "whatsapp_business_account"
             for call in graph_get.await_args_list

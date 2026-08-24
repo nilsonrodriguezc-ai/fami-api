@@ -33,6 +33,10 @@ META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN", "").strip()
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID", "").strip()
 INTERNAL_API_TOKEN = os.getenv("INTERNAL_API_TOKEN", "").strip()
 GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v23.0").strip()
+META_BUSINESS_ID = (
+    os.getenv("META_BUSINESS_ID") or os.getenv("BUSINESS_ID") or ""
+).strip()
+KNOWN_DIAGNOSTIC_WABA_ID = "1553678296345682"
 CATALOGO_URL = "https://nilsonrc9.wixsite.com/famalandia/tienda"
 
 
@@ -554,6 +558,59 @@ async def meta_diagnostics(
     else:
         phone_check["account_mode_check"] = account_mode_check
 
+    known_waba_raw = await _meta_graph_get(
+        KNOWN_DIAGNOSTIC_WABA_ID, fields="id,name"
+    )
+    known_numbers_raw = await _meta_graph_get(
+        f"{KNOWN_DIAGNOSTIC_WABA_ID}/phone_numbers",
+        fields="id,display_phone_number,verified_name,quality_rating",
+    )
+    known_numbers = (
+        (known_numbers_raw.get("data") or {}).get("data") or []
+        if known_numbers_raw.get("ok")
+        else []
+    )
+    known_contains_phone = any(
+        isinstance(item, dict)
+        and str(item.get("id") or "") == PHONE_NUMBER_ID
+        for item in known_numbers
+    )
+    known_waba_data = (
+        known_waba_raw.get("data") or {}
+        if known_waba_raw.get("ok")
+        else {}
+    )
+    known_waba_errors: dict[str, Any] = {}
+    if not known_waba_raw.get("ok"):
+        known_waba_errors["waba"] = known_waba_raw.get("error")
+    if not known_numbers_raw.get("ok"):
+        known_waba_errors["phone_numbers"] = known_numbers_raw.get("error")
+    known_waba_test = {
+        "waba_id": KNOWN_DIAGNOSTIC_WABA_ID,
+        "waba_name": known_waba_data.get("name"),
+        "waba_readable": bool(known_waba_raw.get("ok")),
+        "phone_numbers_readable": bool(known_numbers_raw.get("ok")),
+        "contains_expected_phone_number": known_contains_phone,
+        "expected_phone_number_id": PHONE_NUMBER_ID,
+        "http_status": {
+            "waba": known_waba_raw.get("http_status"),
+            "phone_numbers": known_numbers_raw.get("http_status"),
+        },
+        "phone_numbers": [
+            {
+                key: item.get(key)
+                for key in (
+                    "id", "display_phone_number", "verified_name",
+                    "quality_rating",
+                )
+                if key in item
+            }
+            for item in known_numbers
+            if isinstance(item, dict)
+        ],
+        "errors": known_waba_errors,
+    }
+
     businesses_raw = await _meta_graph_get("me/businesses", fields="id,name")
     business_rows = (
         (businesses_raw.get("data") or {}).get("data") or []
@@ -561,10 +618,22 @@ async def meta_diagnostics(
         else []
     )
     businesses = [
-        {"id": str(item.get("id")), "name": item.get("name")}
+        {
+            "id": str(item.get("id")),
+            "name": item.get("name"),
+            "source": "me.businesses",
+        }
         for item in business_rows
         if isinstance(item, dict) and item.get("id")
     ]
+    if META_BUSINESS_ID and all(
+        item["id"] != META_BUSINESS_ID for item in businesses
+    ):
+        businesses.append({
+            "id": META_BUSINESS_ID,
+            "name": None,
+            "source": "environment",
+        })
 
     candidates = _granular_waba_candidates(token_check)
     token_data = token_check.get("data") if token_check.get("ok") else {}
@@ -636,9 +705,36 @@ async def meta_diagnostics(
                 })
     candidates = _unique_waba_candidates(candidates)
 
-    attempts: list[dict[str, Any]] = []
-    resolved_waba: dict[str, Any] | None = None
-    for candidate in candidates:
+    attempts: list[dict[str, Any]] = [{
+        "candidate_id": KNOWN_DIAGNOSTIC_WABA_ID,
+        "candidate_name": known_waba_data.get("name"),
+        "source": "known_waba_test",
+        "business_id": None,
+        "http_status": known_numbers_raw.get("http_status"),
+        "accessible": bool(known_numbers_raw.get("ok")),
+        "contains_phone_number_id": known_contains_phone,
+        **(
+            {"error": known_numbers_raw.get("error")}
+            if not known_numbers_raw.get("ok")
+            else {}
+        ),
+    }]
+    resolved_waba: dict[str, Any] | None = (
+        {
+            "ok": True,
+            "resolved": True,
+            "id": KNOWN_DIAGNOSTIC_WABA_ID,
+            "name": known_waba_data.get("name"),
+            "phone_number_id": PHONE_NUMBER_ID,
+            "source": "known_waba_test",
+            "business_id": None,
+            "phone_numbers_http_status": known_numbers_raw["http_status"],
+            "phone_numbers_accessible": True,
+        }
+        if known_contains_phone
+        else None
+    )
+    for candidate in ([] if resolved_waba else candidates):
         candidate_id = str(candidate["id"])
         numbers_raw = await _meta_graph_get(
             f"{candidate_id}/phone_numbers",
@@ -695,6 +791,7 @@ async def meta_diagnostics(
     business_discovery = {
         "ok": bool(businesses_raw.get("ok")),
         "http_status": businesses_raw.get("http_status"),
+        "configured_business_id": META_BUSINESS_ID or None,
         "system_user_assigned_wabas": assigned_wabas,
         "businesses": businesses,
         "waba_collection_attempts": collection_attempts,
@@ -707,6 +804,7 @@ async def meta_diagnostics(
         "token": token_check,
         "permissions": permissions,
         "phone_number": phone_check,
+        "known_waba_test": known_waba_test,
         "business_discovery": business_discovery,
         "waba": waba_check,
     }
