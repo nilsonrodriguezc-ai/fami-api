@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import create_engine, text
@@ -10,6 +10,7 @@ from sqlalchemy.engine import Engine
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 _engine: Engine | None = None
+MAX_META_TIMESTAMP_SKEW = timedelta(hours=24)
 
 
 def get_engine() -> Engine:
@@ -42,6 +43,34 @@ def normalize_phone(value: str) -> str:
     return f"+{digits}"
 
 
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _parse_whatsapp_timestamp(
+    value: str | int | None,
+) -> datetime | None:
+    if value in (None, ""):
+        return None
+    try:
+        return datetime.fromtimestamp(int(value), tz=timezone.utc)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
+def _conversation_activity_time(
+    whatsapp_timestamp: datetime | None,
+    received_at: datetime,
+) -> datetime:
+    """Use Meta time only when it is plausibly close to server receipt."""
+    if (
+        whatsapp_timestamp is not None
+        and abs(received_at - whatsapp_timestamp) <= MAX_META_TIMESTAMP_SKEW
+    ):
+        return whatsapp_timestamp
+    return received_at
+
+
 def _customer_id(connection: Any, phone: str) -> int | None:
     digits = _phone_digits(phone)
     local_digits = digits[2:] if digits.startswith("51") and len(digits) == 11 else digits
@@ -72,11 +101,9 @@ def save_incoming_text(
     raw_payload: dict[str, Any],
 ) -> tuple[int, bool]:
     normalized_phone = normalize_phone(phone)
-    timestamp = None
-    if whatsapp_timestamp:
-        timestamp = datetime.fromtimestamp(
-            int(whatsapp_timestamp), tz=timezone.utc
-        )
+    received_at = _utc_now()
+    timestamp = _parse_whatsapp_timestamp(whatsapp_timestamp)
+    activity_at = _conversation_activity_time(timestamp, received_at)
     with get_engine().begin() as connection:
         customer_id = _customer_id(connection, normalized_phone)
         conversation = connection.execute(
@@ -87,7 +114,7 @@ def save_incoming_text(
                     last_message_at, last_message_preview
                 ) VALUES (
                     :phone, :wa_id, :customer_id, :display_name,
-                    COALESCE(:message_at, NOW()), :preview
+                    :activity_at, :preview
                 )
                 ON CONFLICT (phone_number) DO UPDATE SET
                     wa_id = COALESCE(EXCLUDED.wa_id, whatsapp_conversations.wa_id),
@@ -107,7 +134,7 @@ def save_incoming_text(
                 "wa_id": wa_id,
                 "customer_id": customer_id,
                 "display_name": display_name,
-                "message_at": timestamp,
+                "activity_at": activity_at,
                 "preview": text_body[:240],
             },
         ).scalar_one()
@@ -141,7 +168,7 @@ def save_incoming_text(
                 text(
                     """
                     UPDATE whatsapp_conversations
-                    SET last_message_at = COALESCE(:message_at, NOW()),
+                    SET last_message_at = :activity_at,
                         last_message_preview = :preview,
                         unread_count = unread_count + 1,
                         status = CASE
@@ -152,7 +179,7 @@ def save_incoming_text(
                     """
                 ),
                 {
-                    "message_at": timestamp,
+                    "activity_at": activity_at,
                     "preview": text_body[:240],
                     "conversation_id": int(conversation),
                 },

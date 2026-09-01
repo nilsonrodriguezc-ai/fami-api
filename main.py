@@ -493,6 +493,11 @@ async def _process_incoming_message(
         whatsapp_timestamp=message.get("timestamp"),
         raw_payload=message,
     )
+    logger.info(
+        "Mensaje entrante persistido conversation_id=%s inserted=%s",
+        conversation_id,
+        str(inserted).lower(),
+    )
     if not inserted:
         logger.info("Mensaje duplicado ignorado id=%s", message_id)
         return
