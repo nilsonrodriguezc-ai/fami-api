@@ -14,13 +14,17 @@ from typing import Any
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, Response
 from pydantic import BaseModel, Field
 
 from database import (
     DATABASE_URL, get_conversation, get_operator, normalize_phone,
-    save_audit, save_incoming_text, save_outgoing_text,
-    update_message_status,
+    get_message_media, save_audit, save_incoming_media, save_incoming_text,
+    save_outgoing_text, update_incoming_media, update_message_status,
+)
+from media_service import (
+    ALLOWED_MIME_TYPES, MediaProcessingError, download_private_media,
+    fetch_meta_media, safe_filename, store_private_media,
 )
 
 
@@ -471,7 +475,19 @@ async def _process_incoming_message(
         "Mensaje entrante tipo=%s id=%s remitente=***%s",
         message_type, message_id, phone[-4:] if phone else "",
     )
-    if message_type != "text" or not message_id or not phone:
+    if not message_id or not phone:
+        logger.info("Mensaje entrante incompleto ignorado")
+        return
+    if message_type in {"image", "document"}:
+        await _process_incoming_media(
+            message=message,
+            contacts=contacts,
+            message_type=message_type,
+            message_id=message_id,
+            phone=phone,
+        )
+        return
+    if message_type != "text":
         logger.info("Tipo de mensaje reservado para una fase posterior")
         return
     body = str((message.get("text") or {}).get("body") or "")
@@ -517,6 +533,149 @@ async def _process_incoming_message(
             automated=True,
             raw_payload=result,
         )
+
+
+async def _process_incoming_media(
+    *,
+    message: dict[str, Any],
+    contacts: dict[str, str],
+    message_type: str,
+    message_id: str,
+    phone: str,
+) -> None:
+    media = message.get(message_type) or {}
+    if not isinstance(media, dict):
+        media = {}
+    meta_media_id = str(media.get("id") or "")
+    declared_mime = str(media.get("mime_type") or "").lower() or None
+    original_filename = (
+        str(media.get("filename") or "") or None
+        if message_type == "document"
+        else None
+    )
+    caption = str(media.get("caption") or "") or None
+    filename = safe_filename(original_filename, meta_media_id or message_id, declared_mime)
+    if not DATABASE_URL:
+        logger.warning("No se guardó multimedia: DATABASE_URL no configurada")
+        return
+    conversation_id, message_db_id, inserted = save_incoming_media(
+        whatsapp_message_id=message_id,
+        phone=phone,
+        wa_id=phone,
+        display_name=contacts.get(phone),
+        message_type=message_type,
+        meta_media_id=meta_media_id,
+        mime_type=declared_mime,
+        original_filename=original_filename,
+        safe_filename=filename,
+        caption=caption,
+        whatsapp_timestamp=message.get("timestamp"),
+        raw_payload=message,
+    )
+    logger.info(
+        "Mensaje multimedia persistido conversation_id=%s inserted=%s",
+        conversation_id,
+        str(inserted).lower(),
+    )
+    if not inserted or message_db_id is None:
+        logger.info("Mensaje multimedia duplicado ignorado id=%s", message_id)
+        return
+    if not meta_media_id:
+        update_incoming_media(
+            message_db_id,
+            media_status="failed",
+            error_code="missing_media_id",
+            error_detail="Meta no incluyó un identificador multimedia.",
+        )
+        return
+    if declared_mime and declared_mime not in ALLOWED_MIME_TYPES:
+        update_incoming_media(
+            message_db_id,
+            media_status="rejected",
+            mime_type=declared_mime,
+            error_code="unsupported_mime_type",
+            error_detail="El tipo de archivo no está permitido.",
+        )
+        logger.info(
+            "Multimedia rechazada antes de descargar id=%s code=%s",
+            message_id,
+            "unsupported_mime_type",
+        )
+        return
+    try:
+        content, actual_mime, reported_size = await fetch_meta_media(
+            media_id=meta_media_id,
+            access_token=META_ACCESS_TOKEN,
+            graph_api_version=GRAPH_API_VERSION,
+        )
+        if declared_mime and declared_mime != actual_mime:
+            raise MediaProcessingError(
+                "mime_type_mismatch",
+                "El tipo informado por el webhook no coincide con Meta.",
+                size_bytes=reported_size or len(content),
+            )
+        if actual_mime not in ALLOWED_MIME_TYPES:
+            raise MediaProcessingError(
+                "unsupported_mime_type", "El tipo de archivo no está permitido."
+            )
+        filename = safe_filename(
+            original_filename, meta_media_id or message_id, actual_mime
+        )
+        message_path_id = re.sub(r"[^A-Za-z0-9._-]", "-", message_id)[:180]
+        storage_path = (
+            f"whatsapp/{conversation_id}/{message_path_id}/{filename}"
+        )
+        stored = await store_private_media(
+            content=content,
+            mime_type=actual_mime,
+            storage_path=storage_path,
+        )
+        update_incoming_media(
+            message_db_id,
+            media_status="ready",
+            mime_type=stored.mime_type,
+            safe_filename=filename,
+            storage_bucket=stored.storage_bucket,
+            storage_path=stored.storage_path,
+            size_bytes=stored.size_bytes,
+            sha256=stored.sha256,
+        )
+    except MediaProcessingError as error:
+        rejected = error.code in {
+            "file_too_large", "unsupported_mime_type",
+            "mime_type_mismatch", "content_type_mismatch",
+        }
+        update_incoming_media(
+            message_db_id,
+            media_status="rejected" if rejected else "failed",
+            size_bytes=error.size_bytes,
+            error_code=error.code,
+            error_detail=error.detail,
+        )
+        logger.warning(
+            "Multimedia no procesada id=%s code=%s", message_id, error.code
+        )
+        if error.code == "file_too_large":
+            automatic_text = (
+                "El archivo que enviaste supera el límite permitido de 10 MB "
+                "📎. Por favor, envíalo nuevamente en un tamaño menor."
+            )
+            try:
+                result = await enviar_mensaje(phone, automatic_text)
+                save_outgoing_text(
+                    whatsapp_message_id=_message_id(result),
+                    conversation_id=conversation_id,
+                    phone=phone,
+                    text_body=automatic_text,
+                    sent_by_user_id=None,
+                    sent_by_user_name="Automatización de archivos",
+                    automated=True,
+                    raw_payload=result,
+                )
+            except RuntimeError:
+                logger.exception(
+                    "No se pudo enviar el aviso de archivo demasiado grande"
+                )
 
 
 async def process_webhook_payload(payload: dict[str, Any]) -> None:
@@ -1456,3 +1615,45 @@ async def send_internal_text(
         "sent_by_user_id": str(operator["id"]),
         "sent_by_user_name": str(operator["nombre_completo"]),
     }
+
+
+@app.get("/internal/whatsapp/media/{message_id}")
+async def get_internal_whatsapp_media(
+    message_id: int,
+    x_internal_token: str | None = Header(default=None),
+) -> Response:
+    """Return private media bytes only to an authenticated internal caller."""
+    if not INTERNAL_API_TOKEN or not hmac.compare_digest(
+        x_internal_token or "", INTERNAL_API_TOKEN
+    ):
+        raise HTTPException(status_code=401, detail="Acceso interno no autorizado")
+    media = get_message_media(message_id)
+    if not media:
+        raise HTTPException(status_code=404, detail="Archivo no encontrado")
+    if media.get("media_status") != "ready":
+        raise HTTPException(status_code=409, detail="El archivo aún no está disponible")
+    bucket = str(media.get("storage_bucket") or "")
+    storage_path = str(media.get("storage_path") or "")
+    if not bucket or not storage_path:
+        raise HTTPException(status_code=404, detail="Archivo no encontrado")
+    try:
+        content = await download_private_media(bucket, storage_path)
+    except MediaProcessingError as error:
+        logger.warning(
+            "No se recuperó multimedia message_id=%s code=%s",
+            message_id,
+            error.code,
+        )
+        raise HTTPException(
+            status_code=502, detail="No se pudo recuperar el archivo."
+        ) from error
+    filename = str(media.get("safe_filename") or "archivo")
+    return Response(
+        content=content,
+        media_type=str(media.get("mime_type") or "application/octet-stream"),
+        headers={
+            "Content-Disposition": f'inline; filename="{filename}"',
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )

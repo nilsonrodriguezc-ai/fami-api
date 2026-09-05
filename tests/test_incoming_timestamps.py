@@ -152,6 +152,43 @@ class IncomingTimestampTests(unittest.TestCase):
             message_sql,
         )
 
+    def test_duplicate_media_does_not_increment_unread_count(self):
+        connection = _Connection(inserted_id=None)
+        raw_payload = {
+            "id": "wamid.media", "type": "image",
+            "timestamp": str(int(self.received_at.timestamp())),
+            "image": {"id": "media-1", "mime_type": "image/jpeg"},
+        }
+        with (
+            patch.object(database, "get_engine", return_value=_Engine(connection)),
+            patch.object(database, "_utc_now", return_value=self.received_at),
+        ):
+            result = database.save_incoming_media(
+                whatsapp_message_id="wamid.media",
+                phone="51999999999",
+                wa_id="51999999999",
+                display_name="Cliente",
+                message_type="image",
+                meta_media_id="media-1",
+                mime_type="image/jpeg",
+                original_filename=None,
+                safe_filename="archivo.jpg",
+                caption=None,
+                whatsapp_timestamp=raw_payload["timestamp"],
+                raw_payload=raw_payload,
+            )
+        self.assertEqual(result, (3, None, False))
+        self.assertFalse(any(
+            "UPDATE whatsapp_conversations" in sql
+            for sql, _ in connection.calls
+        ))
+        message_sql, message_params = next(
+            (sql, params) for sql, params in connection.calls
+            if "INSERT INTO whatsapp_messages" in sql
+        )
+        self.assertIn("ON CONFLICT (whatsapp_message_id) DO NOTHING", message_sql)
+        self.assertEqual(json.loads(message_params["raw_payload"]), raw_payload)
+
 
 if __name__ == "__main__":
     unittest.main()
