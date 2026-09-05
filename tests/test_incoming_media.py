@@ -5,6 +5,8 @@ import os
 import unittest
 from unittest.mock import AsyncMock, patch
 
+import httpx
+
 os.environ.setdefault("VERIFY_TOKEN", "verify-test")
 os.environ.setdefault("META_ACCESS_TOKEN", "meta-test")
 os.environ.setdefault("PHONE_NUMBER_ID", "phone-test")
@@ -174,6 +176,99 @@ class MediaValidationTests(unittest.TestCase):
         result = media_service.safe_filename("../../mi comprobante.PDF", "id", "application/pdf")
         self.assertEqual(result, "mi-comprobante.pdf")
         self.assertNotIn("..", result)
+
+
+class _StorageClient:
+    response: httpx.Response | None = None
+    request_error: httpx.RequestError | None = None
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    async def __aenter__(self) -> "_StorageClient":
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        return None
+
+    async def post(self, *args: object, **kwargs: object) -> httpx.Response:
+        if self.request_error is not None:
+            raise self.request_error
+        assert self.response is not None
+        return self.response
+
+
+class StorageObservabilityTests(unittest.TestCase):
+    secret = "service-role-secret-must-not-leak"
+    object_path = "whatsapp/3/wamid/documento-seguro.pdf"
+
+    def _run_upload(self) -> media_service.MediaProcessingError:
+        with (
+            patch.object(media_service, "SUPABASE_URL", "https://project.supabase.co"),
+            patch.object(media_service, "SUPABASE_SERVICE_ROLE_KEY", self.secret),
+            patch.object(media_service, "WHATSAPP_MEDIA_BUCKET", "whatsapp-media"),
+            patch.object(media_service.httpx, "AsyncClient", _StorageClient),
+        ):
+            with self.assertRaises(media_service.MediaProcessingError) as context:
+                asyncio.run(media_service.store_private_media(
+                    content=b"%PDF-1.7 test",
+                    mime_type="application/pdf",
+                    storage_path=self.object_path,
+                ))
+        return context.exception
+
+    def test_http_errors_are_sanitized_and_keep_functional_error(self) -> None:
+        for status in (401, 403, 404, 409):
+            with self.subTest(status=status):
+                request = httpx.Request(
+                    "POST",
+                    "https://project.supabase.co/storage/v1/object/whatsapp-media/path",
+                )
+                _StorageClient.request_error = None
+                _StorageClient.response = httpx.Response(
+                    status,
+                    request=request,
+                    json={
+                        "statusCode": str(status),
+                        "code": "StorageError",
+                        "error": "Upload rejected",
+                        "message": (
+                            f"Authorization: Bearer {self.secret} "
+                            f"apikey={self.secret} {self.object_path}"
+                        ),
+                    },
+                )
+                with self.assertLogs("fami-api.media", level="ERROR") as logs:
+                    error = self._run_upload()
+                output = "\n".join(logs.output)
+                self.assertEqual(error.code, "storage_upload_failed")
+                self.assertIn(f"status={status}", output)
+                self.assertIn("StorageError", output)
+                self.assertNotIn(self.secret, output)
+                self.assertNotIn(self.object_path, output)
+                self.assertNotIn("https://project.supabase.co", output)
+
+    def test_connection_error_logs_only_safe_type_and_message(self) -> None:
+        request = httpx.Request(
+            "POST",
+            "https://project.supabase.co/storage/v1/object/whatsapp-media/path",
+        )
+        _StorageClient.response = None
+        _StorageClient.request_error = httpx.ConnectError(
+            f"Connection failed token={self.secret} {self.object_path}",
+            request=request,
+        )
+        with self.assertLogs("fami-api.media", level="ERROR") as logs:
+            error = self._run_upload()
+        output = "\n".join(logs.output)
+        self.assertEqual(error.code, "storage_upload_failed")
+        self.assertIn("type=ConnectError", output)
+        self.assertNotIn(self.secret, output)
+        self.assertNotIn(self.object_path, output)
+
+    def tearDown(self) -> None:
+        _StorageClient.response = None
+        _StorageClient.request_error = None
 
 
 class MediaEndpointTests(unittest.TestCase):

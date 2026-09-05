@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import logging
 import os
 import re
 import urllib.parse
@@ -9,6 +11,7 @@ from dataclasses import dataclass
 import httpx
 
 
+logger = logging.getLogger("fami-api.media")
 MAX_MEDIA_BYTES = 10 * 1024 * 1024
 ALLOWED_MIME_TYPES = {"image/jpeg", "image/png", "application/pdf"}
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
@@ -18,6 +21,7 @@ SUPABASE_SERVICE_ROLE_KEY = os.getenv(
 WHATSAPP_MEDIA_BUCKET = os.getenv(
     "SUPABASE_WHATSAPP_MEDIA_BUCKET", "whatsapp-media"
 ).strip()
+MAX_STORAGE_ERROR_TEXT = 300
 
 
 class MediaProcessingError(RuntimeError):
@@ -74,6 +78,31 @@ def _storage_headers() -> dict[str, str]:
         "apikey": SUPABASE_SERVICE_ROLE_KEY,
         "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
     }
+
+
+def _sanitize_storage_log_text(
+    value: object,
+    *,
+    storage_path: str = "",
+    request_url: str = "",
+) -> str:
+    """Redact credentials and object locations before diagnostic logging."""
+    text_value = str(value or "")
+    for sensitive_value in (
+        SUPABASE_SERVICE_ROLE_KEY,
+        request_url,
+        storage_path,
+    ):
+        if sensitive_value:
+            text_value = text_value.replace(sensitive_value, "[REDACTED]")
+    text_value = re.sub(
+        r"(?i)((?:authorization|apikey|access[_-]?token|token)\s*[:=]\s*)"
+        r"(?:bearer\s+)?[^\s,;}]+",
+        r"\1[REDACTED]",
+        text_value,
+    )
+    text_value = re.sub(r"https?://[^\s,;}]+", "[URL_REDACTED]", text_value)
+    return text_value[:MAX_STORAGE_ERROR_TEXT]
 
 
 async def fetch_meta_media(
@@ -158,7 +187,52 @@ async def store_private_media(
         async with httpx.AsyncClient(timeout=60) as client:
             response = await client.post(url, headers=headers, content=content)
             response.raise_for_status()
-    except httpx.HTTPError as error:
+    except httpx.HTTPStatusError as error:
+        response = error.response
+        try:
+            response_data = response.json()
+        except (ValueError, json.JSONDecodeError):
+            response_data = None
+        if isinstance(response_data, dict):
+            safe_fields = {
+                field: _sanitize_storage_log_text(
+                    response_data.get(field),
+                    storage_path=storage_path,
+                    request_url=url,
+                )
+                for field in ("statusCode", "code", "error", "message")
+                if field in response_data
+            }
+            logger.error(
+                "Supabase Storage rechazó la subida status=%s details=%s",
+                response.status_code,
+                safe_fields,
+            )
+        else:
+            safe_text = _sanitize_storage_log_text(
+                response.text,
+                storage_path=storage_path,
+                request_url=url,
+            )
+            logger.error(
+                "Supabase Storage rechazó la subida status=%s response=%s",
+                response.status_code,
+                safe_text,
+            )
+        raise MediaProcessingError(
+            "storage_upload_failed", "No se pudo guardar el archivo privado."
+        ) from error
+    except httpx.RequestError as error:
+        safe_message = _sanitize_storage_log_text(
+            error,
+            storage_path=storage_path,
+            request_url=url,
+        )
+        logger.error(
+            "Error de conexión con Supabase Storage type=%s message=%s",
+            type(error).__name__,
+            safe_message,
+        )
         raise MediaProcessingError(
             "storage_upload_failed", "No se pudo guardar el archivo privado."
         ) from error
